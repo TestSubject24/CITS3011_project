@@ -1,5 +1,8 @@
 import time
+import random
+import networkx as nx
 import timeout_decorator
+
 '''
 WINDOWS COMPATIBILITY NOTE:
     The timeout_decorator package may not work correctly on Windows. For local
@@ -22,10 +25,13 @@ class StudentAgent(Agent):
     '''
 
     @timeout_decorator.timeout(1)
-    def __init__(self, agent_name='Give a nickname'):
+    def __init__(self, agent_name='Greedy Agent'):
         super().__init__(agent_name)
 
         '''Implement your agent here.'''
+
+        self.map_graph_army = None
+        self.map_graph_navy = None
 
     @timeout_decorator.timeout(1)
     def new_game(self, game, power_name):
@@ -33,6 +39,37 @@ class StudentAgent(Agent):
         self.power_name = power_name
 
         '''Implement your agent here.'''
+
+        self.build_map_graphs()
+
+    def build_map_graphs(self):
+        if not self.game:
+            raise Exception('Game Not Initialised. Cannot Build Map Graphs.')
+
+        self.map_graph_army = nx.Graph()
+        self.map_graph_navy = nx.Graph()
+
+        locations = list(self.game.map.loc_type.keys())
+
+        # Add locations that armies and fleets can move through
+        for loc in locations:
+            if self.game.map.loc_type[loc] in ['LAND', 'COAST']:
+                self.map_graph_army.add_node(loc.upper())
+
+            if self.game.map.loc_type[loc] in ['WATER', 'COAST']:
+                self.map_graph_navy.add_node(loc.upper())
+
+        locations = [loc.upper() for loc in locations]
+
+        # Add connections between locations
+        for loc1 in locations:
+            for loc2 in locations:
+
+                if self.game.map.abuts('A', loc1, '-', loc2):
+                    self.map_graph_army.add_edge(loc1, loc2)
+
+                if self.game.map.abuts('F', loc1, '-', loc2):
+                    self.map_graph_navy.add_edge(loc1, loc2)
 
     @timeout_decorator.timeout(1) # This is only for updating the game engine and other states if any. Do not implement heavy stratergy here.
     def update_game(self, all_power_orders):
@@ -45,8 +82,118 @@ class StudentAgent(Agent):
     def get_actions(self):
 
         '''Implement your agent here.'''
-        
-        return [] 
+
+        possible_orders = self.game.get_all_possible_orders()
+
+        orderable_locations = self.game.get_orderable_locations(
+            self.power_name
+        )
+
+        # For retreat/build phases just choose a legal action
+        if self.game.phase_type != 'M':
+            power_orders = []
+
+            for loc in orderable_locations:
+                if possible_orders[loc]:
+                    power_orders.append(
+                        random.choice(possible_orders[loc])
+                    )
+
+            return power_orders
+
+        # Find all supply centres that we do not own
+        my_centres = self.game.get_centers(self.power_name)
+
+        target_centres = []
+
+        for centre in self.game.map.scs:
+            if centre not in my_centres:
+                target_centres.append(centre)
+
+        power_orders = []
+
+        # Decide an action for each unit
+        for loc in orderable_locations:
+
+            loc_orders = possible_orders[loc]
+
+            # Work out if the unit is an army or fleet
+            army_orders = [
+                order for order in loc_orders
+                if order.startswith('A ')
+            ]
+
+            fleet_orders = [
+                order for order in loc_orders
+                if order.startswith('F ')
+            ]
+
+            if army_orders:
+                unit_type = 'A'
+                graph = self.map_graph_army
+
+            elif fleet_orders:
+                unit_type = 'F'
+                graph = self.map_graph_navy
+
+            else:
+                continue
+
+            # If already on a centre that is not ours, stay there
+            if loc in target_centres:
+                hold_order = f'{unit_type} {loc} H'
+
+                if hold_order in loc_orders:
+                    power_orders.append(hold_order)
+
+                continue
+
+            # Get shortest paths from the current location
+            if loc not in graph:
+                continue
+
+            paths = nx.shortest_path(
+                graph,
+                source=loc
+            )
+
+            closest_centre = None
+            closest_distance = float('inf')
+
+            for centre in target_centres:
+
+                if centre not in paths:
+                    continue
+
+                distance = len(paths[centre]) - 1
+
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_centre = centre
+
+            # If there is a reachable centre, move one step towards it
+            if closest_centre is not None:
+
+                path = paths[closest_centre]
+
+                if len(path) > 1:
+                    next_loc = path[1]
+
+                    move_order = (
+                        f'{unit_type} {loc} - {next_loc}'
+                    )
+
+                    if move_order in loc_orders:
+                        power_orders.append(move_order)
+                        continue
+
+            # Otherwise just hold
+            hold_order = f'{unit_type} {loc} H'
+
+            if hold_order in loc_orders:
+                power_orders.append(hold_order)
+
+        return power_orders
 
         '''
         Return a list of orders. Each order is a string, with specific format. For the format, read the game rule and game engine documentation.
