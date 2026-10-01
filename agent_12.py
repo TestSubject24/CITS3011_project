@@ -16,27 +16,29 @@ from agent_baselines import Agent
 class StudentAgent(Agent):
     '''
     Implement your agent here. 
-
     Please read the abstract Agent class from agent_baselines.py first.
-    
     You can add/override attributes and methods as needed.
     '''
+
+    # This was tested at 5, but was less reliable against mixed opponents.
+    FAILED_MOVE_PENALTY = 0
+    UNSUPPORTED_ATTACK_PENALTY = 8
 
     @timeout_decorator.timeout(1)
     def __init__(self, agent_name='Student Agent'):
         super().__init__(agent_name)
 
-        '''Implement your agent here.'''
-
         self.map_graph_army = None
         self.map_graph_navy = None
         self.army_distances = {}
         self.navy_distances = {}
+        self.failed_moves = {}
 
     @timeout_decorator.timeout(1)
     def new_game(self, game, power_name):
         self.game = game
         self.power_name = power_name
+        self.failed_moves = {}
 
         '''Implement your agent here.'''
 
@@ -82,10 +84,32 @@ class StudentAgent(Agent):
 
     @timeout_decorator.timeout(1) # This is only for updating the game engine and other states if any. Do not implement heavy stratergy here.
     def update_game(self, all_power_orders):
+        my_orders = all_power_orders.get(self.power_name, [])
+
         # do not make changes to the following codes
         for power_name in all_power_orders.keys():
             self.game.set_orders(power_name, all_power_orders[power_name])
         self.game.process()
+
+        order_status = self.game.get_order_status(self.power_name)
+
+        for order in my_orders:
+            words = order.split()
+
+            if len(words) not in (4, 5) or words[2] != '-':
+                continue
+
+            unit = ' '.join(words[:2])
+            move = (
+                self.province(words[1]),
+                self.province(words[3])
+            )
+
+            if order_status.get(unit):
+                failures = self.failed_moves.get(move, 0)
+                self.failed_moves[move] = min(failures + 1, 4)
+            else:
+                self.failed_moves.pop(move, None)
 
     @timeout_decorator.timeout(1)
     def get_actions(self):
@@ -200,7 +224,12 @@ class StudentAgent(Agent):
                 None
             )
 
-            if fleet is not None and fleets * 2 < armies:
+            needs_fleet = fleets * 2 < armies
+
+            if self.power_name == 'ENGLAND':
+                needs_fleet = fleets <= armies
+
+            if fleet is not None and needs_fleet:
                 orders.append(fleet)
                 fleets += 1
             elif army is not None:
@@ -235,6 +264,12 @@ class StudentAgent(Agent):
             centre: self.target_value(centre, centre_owner, targets)
             for centre in targets
         }
+        supportable_moves = {
+            order.split(' S ', 1)[1]
+            for loc in locations
+            for order in possible_orders[loc]
+            if ' S ' in order and ' - ' in order.split(' S ', 1)[1]
+        }
 
         choices_by_loc = {}
 
@@ -244,7 +279,8 @@ class StudentAgent(Agent):
                 possible_orders[loc],
                 targets,
                 target_values,
-                unit_owner
+                unit_owner,
+                supportable_moves
             )
 
         # Units with one clearly good route choose first. This also makes the
@@ -257,8 +293,15 @@ class StudentAgent(Agent):
         )
 
         plans = {}
-        destinations = {}
         is_fall = self.game.get_current_phase().startswith('F')
+        destinations = {}
+
+        if is_fall:
+            destinations = {
+                self.province(loc): loc
+                for loc in locations
+                if self.province(loc) in targets
+            }
 
         for loc in unit_order:
             loc_orders = possible_orders[loc]
@@ -307,6 +350,22 @@ class StudentAgent(Agent):
             if chosen is not None:
                 plans[loc] = chosen
 
+        self.add_convoys(
+            plans,
+            locations,
+            possible_orders,
+            targets,
+            target_values,
+            unit_owner,
+            supportable_moves
+        )
+        self.stage_convoys(
+            plans,
+            locations,
+            possible_orders,
+            target_values,
+            unit_owner
+        )
         self.add_support(plans, possible_orders, unit_owner, target_values)
 
         return [plans[loc]['order'] for loc in locations if loc in plans]
@@ -317,7 +376,8 @@ class StudentAgent(Agent):
         loc_orders,
         targets,
         target_values,
-        unit_owner
+        unit_owner,
+        supportable_moves
     ):
         unit_type = self.unit_type(loc_orders)
 
@@ -337,33 +397,362 @@ class StudentAgent(Agent):
                 continue
 
             destination = words[3]
-            best_score = -1000
+            best_score = self.destination_score(
+                destination,
+                targets,
+                target_values,
+                unit_owner,
+                distances
+            )
+            move = (self.province(loc), self.province(destination))
+            best_score -= (
+                self.FAILED_MOVE_PENALTY
+                * self.failed_moves.get(move, 0)
+            )
 
-            for centre in targets:
-                distance = self.distance_to_centre(
-                    destination,
-                    centre,
-                    distances
-                )
+            owner = unit_owner.get(self.province(destination))
 
-                if distance is None:
-                    continue
-
-                score = target_values[centre] - (2 * distance)
-
-                if self.province(destination) == centre:
-                    score += 5
-
-                if unit_owner.get(self.province(destination)) == self.power_name:
-                    score -= 6
-
-                best_score = max(best_score, score)
+            if (
+                owner is not None
+                and owner != self.power_name
+                and order not in supportable_moves
+            ):
+                best_score -= self.UNSUPPORTED_ATTACK_PENALTY
 
             if best_score > -1000:
                 choices.append((best_score, order, destination))
 
         choices.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return choices
+
+    def add_convoys(
+        self,
+        plans,
+        locations,
+        possible_orders,
+        targets,
+        target_values,
+        unit_owner,
+        supportable_moves
+    ):
+        convoy_plans = []
+
+        for loc in locations:
+            if self.unit_type(possible_orders[loc]) != 'A':
+                continue
+
+            for order in possible_orders[loc]:
+                words = order.split()
+
+                if len(words) != 5 or words[2] != '-' or words[4] != 'VIA':
+                    continue
+
+                destination = self.province(words[3])
+
+                # Convoys are reserved for taking centres. Using a fleet just
+                # to move an army between ordinary coastal provinces is rarely
+                # worth losing the fleet's own move.
+                if destination not in target_values:
+                    continue
+
+                if unit_owner.get(destination) == self.power_name:
+                    continue
+
+                fleet_path = self.convoy_path(
+                    loc,
+                    destination,
+                    locations,
+                    possible_orders
+                )
+
+                if not fleet_path:
+                    continue
+
+                score = self.destination_score(
+                    destination,
+                    targets,
+                    target_values,
+                    unit_owner,
+                    self.army_distances
+                )
+                score -= 0.5 * len(fleet_path)
+                score -= self.FAILED_MOVE_PENALTY * self.failed_moves.get(
+                    (self.province(loc), destination),
+                    0
+                )
+
+                owner = unit_owner.get(destination)
+                plain_order = order.removesuffix(' VIA')
+
+                if (
+                    owner is not None
+                    and owner != self.power_name
+                    and plain_order not in supportable_moves
+                ):
+                    score -= self.UNSUPPORTED_ATTACK_PENALTY
+
+                convoy_plans.append(
+                    (score, order, loc, destination, fleet_path)
+                )
+
+        convoy_plans.sort(reverse=True)
+        used_units = set()
+
+        for score, order, army, destination, fleet_path in convoy_plans:
+            convoy_units = {army, *fleet_path}
+
+            if convoy_units & used_units:
+                continue
+
+            if army not in plans or score <= plans[army]['score'] + 1:
+                continue
+
+            if any(
+                fleet in plans
+                and plans[fleet]['score'] > score + 2
+                for fleet in fleet_path
+            ):
+                continue
+
+            destination_taken = any(
+                loc not in convoy_units
+                and plan['destination'] == destination
+                for loc, plan in plans.items()
+            )
+
+            if destination_taken:
+                continue
+
+            plans[army] = {
+                'order': order,
+                'score': score,
+                'destination': destination,
+                'reserved': True
+            }
+
+            for fleet in fleet_path:
+                convoy_order = (
+                    f'F {fleet} C A {army} - {destination}'
+                )
+                plans[fleet] = {
+                    'order': convoy_order,
+                    'score': score,
+                    'destination': None,
+                    'reserved': True
+                }
+
+            used_units.update(convoy_units)
+
+    def stage_convoys(
+        self,
+        plans,
+        locations,
+        possible_orders,
+        target_values,
+        unit_owner
+    ):
+        if not self.game.get_current_phase().startswith('S'):
+            return
+
+        candidates = []
+
+        for army in locations:
+            if self.unit_type(possible_orders[army]) != 'A':
+                continue
+
+            if army not in plans or plans[army]['score'] >= 0:
+                continue
+
+            army_moves = []
+
+            for order in possible_orders[army]:
+                words = order.split()
+
+                if len(words) == 4 and words[2] == '-':
+                    embark = self.province(words[3])
+
+                    if embark not in unit_owner:
+                        army_moves.append((order, embark))
+
+            for fleet in locations:
+                if self.unit_type(possible_orders[fleet]) != 'F':
+                    continue
+
+                if fleet not in plans or ' C ' in plans[fleet]['order']:
+                    continue
+
+                for fleet_order in possible_orders[fleet]:
+                    words = fleet_order.split()
+
+                    if len(words) == 3 and words[2] == 'H':
+                        sea = fleet
+                    elif len(words) == 4 and words[2] == '-':
+                        sea = words[3]
+                    else:
+                        continue
+
+                    if self.game.map.loc_type.get(sea) != 'WATER':
+                        continue
+
+                    if sea in unit_owner and sea != fleet:
+                        continue
+
+                    for army_order, embark in army_moves:
+                        if not self.fleet_abuts(sea, embark):
+                            continue
+
+                        reachable_targets = [
+                            target for target in target_values
+                            if self.fleet_abuts(sea, target)
+                            and unit_owner.get(target) != self.power_name
+                        ]
+
+                        if not reachable_targets:
+                            continue
+
+                        target = max(
+                            reachable_targets,
+                            key=lambda centre: target_values[centre]
+                        )
+                        score = target_values[target] + 2.5
+                        candidates.append(
+                            (
+                                score,
+                                army,
+                                army_order,
+                                embark,
+                                fleet,
+                                fleet_order,
+                                sea
+                            )
+                        )
+
+        candidates.sort(reverse=True)
+        used_units = set()
+
+        for candidate in candidates:
+            (
+                score,
+                army,
+                army_order,
+                embark,
+                fleet,
+                fleet_order,
+                sea
+            ) = candidate
+
+            if army in used_units or fleet in used_units:
+                continue
+
+            if score < plans[fleet]['score']:
+                continue
+
+            occupied_destinations = {
+                plan['destination']
+                for loc, plan in plans.items()
+                if loc not in {army, fleet}
+            }
+
+            if embark in occupied_destinations or sea in occupied_destinations:
+                continue
+
+            plans[army] = {
+                'order': army_order,
+                'score': score,
+                'destination': embark,
+                'reserved': True
+            }
+            plans[fleet] = {
+                'order': fleet_order,
+                'score': score,
+                'destination': sea,
+                'reserved': True
+            }
+            used_units.update({army, fleet})
+
+    def convoy_path(self, source, destination, locations, possible_orders):
+        convoy_fleets = []
+
+        for loc in locations:
+            order = f'F {loc} C A {source} - {destination}'
+
+            if order in possible_orders[loc]:
+                convoy_fleets.append(loc)
+
+        if not convoy_fleets:
+            return None
+
+        start_fleets = [
+            fleet for fleet in convoy_fleets
+            if self.fleet_abuts(fleet, source)
+        ]
+        end_fleets = {
+            fleet for fleet in convoy_fleets
+            if self.fleet_abuts(fleet, destination)
+        }
+
+        queue = [(fleet, [fleet]) for fleet in start_fleets]
+        visited = set(start_fleets)
+
+        while queue:
+            fleet, path = queue.pop(0)
+
+            if fleet in end_fleets:
+                return path
+
+            for neighbour in convoy_fleets:
+                if neighbour in visited:
+                    continue
+
+                if self.game.map.abuts('F', fleet, '-', neighbour):
+                    visited.add(neighbour)
+                    queue.append((neighbour, path + [neighbour]))
+
+        return None
+
+    def fleet_abuts(self, fleet, province):
+        locations = [province]
+        locations.extend(
+            loc for loc in self.game.map.loc_type
+            if loc.startswith(f'{province}/')
+        )
+
+        return any(
+            self.game.map.abuts('F', fleet, '-', loc)
+            for loc in locations
+        )
+
+    def destination_score(
+        self,
+        destination,
+        targets,
+        target_values,
+        unit_owner,
+        distances
+    ):
+        best_score = -1000
+
+        for centre in targets:
+            distance = self.distance_to_centre(
+                destination,
+                centre,
+                distances
+            )
+
+            if distance is None:
+                continue
+
+            score = target_values[centre] - (2 * distance)
+
+            if self.province(destination) == centre:
+                score += 5
+
+            if unit_owner.get(self.province(destination)) == self.power_name:
+                score -= 6
+
+            best_score = max(best_score, score)
+
+        return best_score
 
     def add_support(self, plans, possible_orders, unit_owner, target_values):
         attacks = []
@@ -382,9 +771,7 @@ class StudentAgent(Agent):
             enemy_nearby = any(
                 owner != self.power_name
                 and any(
-                    len(order.split()) == 4
-                    and order.split()[2] == '-'
-                    and self.province(order.split()[3]) == destination
+                    self.order_moves_to(order, destination)
                     for order in possible_orders.get(loc, [])
                 )
                 for loc, owner in unit_owner.items()
@@ -404,15 +791,22 @@ class StudentAgent(Agent):
                 continue
 
             attack_order = plans[attacker]['order']
+            supported_order = attack_order.removesuffix(' VIA')
             candidates = []
 
             for loc, plan in plans.items():
                 if loc == attacker or loc in used_supporters:
                     continue
 
+                if plan.get('reserved'):
+                    continue
+
+                if ' C ' in plan['order'] or plan['order'].endswith(' VIA'):
+                    continue
+
                 support_order = (
                     f'{self.unit_type(possible_orders[loc])} '
-                    f'{loc} S {attack_order}'
+                    f'{loc} S {supported_order}'
                 )
 
                 if support_order in possible_orders[loc]:
@@ -440,6 +834,11 @@ class StudentAgent(Agent):
             used_supporters.add(supporter)
 
     def target_value(self, centre, centre_owner, targets):
+        # The central powers already have plenty of nearby choices. Giving
+        # their clusters another bonus made them crowd one front too early.
+        if self.power_name in {'AUSTRIA', 'GERMANY', 'ITALY'}:
+            return 12
+
         owner = centre_owner.get(centre)
 
         # Neutral centres are usually the safest early gains. Enemy centres are
@@ -474,6 +873,16 @@ class StudentAgent(Agent):
     @staticmethod
     def province(location):
         return location.split('/')[0]
+
+    @classmethod
+    def order_moves_to(cls, order, destination):
+        words = order.split()
+
+        return (
+            len(words) in (4, 5)
+            and words[2] == '-'
+            and cls.province(words[3]) == destination
+        )
 
     @staticmethod
     def unit_type(orders):
